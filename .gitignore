@@ -125,6 +125,7 @@ celerybeat.pid
 
 # Environments
 .env
+.sesskey
 .venv
 env/
 venv/
