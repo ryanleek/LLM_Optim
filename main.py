@@ -18,19 +18,45 @@ openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app, rt = fast_app()
 msgList = []
 
+def gpt_call(msg, mode):
+
+  messages = [
+    {"role": "user", "content": msg}
+  ]
+
+  response = openai.chat.completions.create(
+    model = "gpt-4o",
+    messages = messages,
+    response_format = {"type": mode},
+    temperature = 0.1
+  )
+
+  return json.loads(response.choices[0].message.content), messages
+
 def get_kst_time():
     kst_tz = pytz.timezone("Asia/Seoul")
     return datetime.now(kst_tz)
 
 def add_task(context, data):
-    #timestamp = get_kst_time().strftime(TIMESTAMP_FMT)
     supabase.table("task").insert(
         {"context": context, "data": data}
     ).execute()
 
+def add_message(sender, content):
+    timestamp = get_kst_time().strftime(TIMESTAMP_FMT)
+    supabase.table("messages").insert(
+        {"sender": sender, "content": content, "timestamp": timestamp}
+    ).execute()
+
+def get_messages():
+    response = (
+        supabase.table("messages").select("*").order("id", desc=False).execute()
+    )
+    return response.data
+
 def get_prompts():
     response = (
-        supabase.table("prompts").select("*").order("id", desc=True).execute()
+        supabase.table("prompts").select("*").order("id", desc=False).execute()
     )
     return response.data
 
@@ -41,7 +67,6 @@ def get_prompt(prompt, context):
     return response.data[0]['content']
 
 def render_process(entry):
-    print(entry)
     return Details(
         Summary(
             entry['name'],
@@ -52,12 +77,28 @@ def render_process(entry):
         P(entry['content']),
     )
 
+def render_message(entry):
+    return Article(
+        Header(entry["name"]),
+        P(entry['content']),
+        Footer
+    ),
+
 def render_process_list():
     prompts = get_prompts()
 
     return Div(
         *[render_process(entry) for entry in prompts],
         id="process-list",
+        style="overflow: scroll"
+    )
+
+def render_message_list():
+    messages = get_messages()
+
+    return Div(
+        *[render_message(entry) for entry in messages],
+        id="message-list",
         style="overflow: scroll"
     )
 
@@ -80,6 +121,9 @@ def render_content():
                         Option(
                             "food",
                         ),
+                        Option(
+                            "calendar",
+                        ),
                         name="data",
                         required=True,
                     ),
@@ -98,12 +142,14 @@ def render_content():
             Input(
                 type="text",
                 name="message",
+                placeholder="Type in your message",
+                required=True
             ),
-            Button("Send"),
+            Button("Send", type="submit"),
         ),
         method="post",
         hx_post="/submit-preference",
-        hx_target="#process-list",
+        hx_target="#message-list",
         hx_swap="outerHTML",
         hx_on__after_request="this.reset()",
     ),
@@ -113,6 +159,7 @@ def render_content():
         Hr(),
         render_process_list(),
         Hr(),
+        render_message_list(),
         footer,
     )
 
@@ -126,7 +173,7 @@ def post(context: str, data: str):
 
 @rt("/submit-preference", methods=["POST"])
 def post(message: str):
-    #add_message(message)
+    add_message("user", message)
     return render_process_list()
 
 serve()
