@@ -1,179 +1,289 @@
 import os
 import json
-from datetime import datetime
+import string
+import time
+import copy
 
-import pytz
 from supabase import create_client
 from dotenv import load_dotenv
 from openai import OpenAI
 from fasthtml.common import*
 
+from server_component import add_message, get_messages, get_prompts
+
 
 load_dotenv()
-
-TIMESTAMP_FMT = "%Y-%m-%d %I:%M:%S %p KST"
-
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app, rt = fast_app()
-msgList = []
 
-def gpt_call(msg, mode):
+CONTEXT = ""
+PROMPTS = get_prompts(supabase)
+REQUESTS = []
+PROCESSES = []
+MESSAGES = []
+OPTIONS = ["food", "calendar"]
+CLIENT = {
+    "objective": "",
+    "preferences": [],
+    "constraints": []
+}
+DATA = ["has_beef", "has_pork", "has_chicken", "has_fish", "has_shrimp", "has_egg", "has_pickle", "has_tomato", "has_bacon", "has_seasame", "has_milk", "has_cheese",
+           "has_cilantro", "has_raw_ingredient",
+           "calorie", "fat", "protein", "carbohydrate", "sodium", "sugar", "price",
+           "is_value_deal", "preparation_time", "is_new_menu", "for_one_person", "for_two_people", "for_family"]
 
-  messages = [
-    {"role": "user", "content": msg}
-  ]
+def gpt_response(msgL, res_type, is_stream=True):
 
-  response = openai.chat.completions.create(
+  return openai.chat.completions.create(
     model = "gpt-4o",
-    messages = messages,
-    response_format = {"type": mode},
-    temperature = 0.1
-  )
+    messages = msgL,
+    response_format = {"type": res_type},
+    temperature = 0.1,
+    stream=is_stream
+)
 
-  return json.loads(response.choices[0].message.content), messages
+def update_client(client, response):
+    prev = copy.deepcopy(client)
 
-def get_kst_time():
-    kst_tz = pytz.timezone("Asia/Seoul")
-    return datetime.now(kst_tz)
+    client['objective'] = response['objective']
+    client['preferences'] = response['preferences']
+    client['constraints'] = response['constraints']
 
-def add_task(context, data):
-    supabase.table("task").insert(
-        {"context": context, "data": data}
-    ).execute()
+    return prev, client
 
-def add_message(sender, content):
-    timestamp = get_kst_time().strftime(TIMESTAMP_FMT)
-    supabase.table("messages").insert(
-        {"sender": sender, "content": content, "timestamp": timestamp}
-    ).execute()
 
-def get_messages():
-    response = (
-        supabase.table("messages").select("*").order("id", desc=False).execute()
-    )
-    return response.data
+def form_prompt(p_idx, client=CLIENT):
+    pTemp = PROMPTS[p_idx]
 
-def get_prompts():
-    response = (
-        supabase.table("prompts").select("*").order("id", desc=False).execute()
-    )
-    return response.data
+    if pTemp['name'] == "feat_extract":
+        prompt = string.Template(pTemp['content']).substitute(context=CONTEXT, req=str(REQUESTS))
 
-def get_prompt(prompt, context):
-    response = (
-        supabase.table(prompt).select("*").eq("name", context).execute()
-    )
-    return response.data[0]['content']
+    elif pTemp['name'] == "feat_match":
 
-def render_process(entry):
+        while True:
+            if PROCESSES[p_idx-1]['generating'] == False:
+
+                response = json.loads(PROCESSES[p_idx-1]['content'])
+
+                update_client(client, response)
+                client_feat = client['preferences'] + client['constraints']
+
+                prompt = string.Template(pTemp['content']).substitute(cl_feat=str(client_feat), db_feat=str(DATA))
+                break
+    
+    elif pTemp['name'] == "feat_score":
+
+        while True:
+            if PROCESSES[p_idx-1]['generating'] == False:
+                response = json.loads(PROCESSES[p_idx-1]['content'])
+
+                for feat in response["result"]:
+                    for pref in client["preferences"]:
+                        if pref["name"] == feat["feature"]:
+                            pref["name"] = feat["db_name"]
+                            break
+                    for const in client["constraints"]:
+                        if const["name"] == feat["feature"]:
+                            const["name"] = feat["db_name"]
+                            break
+                
+                prompt = string.Template(pTemp['content']).substitute(req = str(REQUESTS), pref = str(CLIENT["preferences"]), const = str(CLIENT["constraints"]))
+                break
+
+    elif pTemp['name'] == "func_gen":
+        prompt = "Write error message in json format."
+
+    else:
+        prompt = "Write error message in json format."
+
+    return [{"role": "user", "content": prompt}]
+
+def Process(pcs_idx):
+    pcs = PROCESSES[pcs_idx]
+    text = "..." if pcs['content'] == "" else pcs['content']
+    generating = 'generating' in PROCESSES[pcs_idx] and PROCESSES[pcs_idx]['generating']
+    stream_args = {"hx_trigger": "every 0.1s", "hx_swap": "outerHTML", "hx_get": f"/pcs/{pcs_idx}"}
+    
     return Details(
         Summary(
-            entry['name'],
+            PROMPTS[pcs_idx%4]['name'],
+            # Span(
+            # aria_busy="false",
+            # ),
             role="button",
             cls="secondary",
-            id="process",
         ),
-        P(entry['content']),
+        P(text),
+        id=f"pcs-{pcs_idx}",
+        **stream_args if generating else {}
     )
 
-def render_message(entry):
-    return Article(
-        Header(entry["name"]),
-        P(entry['content']),
-        Footer
-    ),
+@app.get("/pcs/{pcs_idx}")
+def get_Process(pcs_idx:int):
+    if pcs_idx >= len(PROCESSES): return ""
+    return Process(pcs_idx)
 
-def render_process_list():
-    prompts = get_prompts()
+@app.get("/pcs-list")
+def get_ProcessList():
+    return Div(*[Process(i) for i in range(len(PROCESSES))])
 
+def Message(msg_idx):
+    msg = MESSAGES[msg_idx]
+    text = "..." if msg['content'] == "" else msg['content']
+    generating = 'generating' in MESSAGES[msg_idx] and MESSAGES[msg_idx]['generating']
+    stream_args = {"hx_trigger": "every 0.1s", "hx_swap": "outerHTML", "hx_get": f"/msg/{msg_idx}"}
     return Div(
-        *[render_process(entry) for entry in prompts],
-        id="process-list",
-        style="overflow: scroll"
+        Header(msg['role']),
+        P(text),
+        #Footer(Small(Em(f"Date: {entry['timestamp']}"))),
+        id = f"msg-{msg_idx}",
+        **stream_args if generating else {}
     )
 
-def render_message_list():
-    messages = get_messages()
+@app.get("/msg/{msg_idx}")
+def get_Message(msg_idx:int):
+    if msg_idx >= len(MESSAGES): return ""
+    return Message(msg_idx)
 
-    return Div(
-        *[render_message(entry) for entry in messages],
-        id="message-list",
-        style="overflow: scroll"
+@app.get("/msg-list")
+def get_MessageList():
+    return Div(*[Message(i) for i in range(len(MESSAGES))])
+
+def ChatInput():
+    return Input(
+        type="text",
+        name="user_input",
+        id="msg-input",
+        placeholder="Type in your message",
+        required=True,
+        hx_swap_oob="true"
     )
 
 def render_content():
     header = Form(
-        Fieldset(
-            Label(
-                "Context",
-                Input(
-                type="text",
-                name="context",
-                value=get_prompt("contexts", "food"),
-                required=True,
-                ),
-            ),
-            Label(
-                "Data",
-                Grid(
-                    Select(
-                        Option(
-                            "food",
-                        ),
-                        Option(
-                            "calendar",
-                        ),
-                        name="data",
-                        required=True,
-                    ),
-                    Div(),
-                    Div(),
-                    Button("Submit", type="submit"),
-                ),
-            ),
-            method="post",
-            hx_post="/submit-context-data",
+        Label("Context"),
+        Input(
+            type="text",
+            id="context-input",
+            name="context",
+            value="You work at a burger restaurant. You are trying to optimize client's choice of menu.",
+            required=True,
         ),
-    ),
-
-    footer = Form(
+        Label("Data"),
         Group(
-            Input(
-                type="text",
-                name="message",
-                placeholder="Type in your message",
-                required=True
+            Select(
+                *[Option(opt) for opt in OPTIONS],
+                name="data",
+                required=True,
             ),
-            Button("Send", type="submit"),
+            Button("Submit", type="submit"),
         ),
         method="post",
-        hx_post="/submit-preference",
-        hx_target="#message-list",
-        hx_swap="outerHTML",
+        hx_post="/submit-context",
+        hx_target="#context-input",
+        hx_swap="innerHTML",
         hx_on__after_request="this.reset()",
-    ),
+    )
+    footer = Form(
+        Group(
+            ChatInput(),
+            Button("Send"),
+        ),
+        hx_post="/intent-check",
+        hx_target="#pcs-list",
+        hx_swap="beforeend"
+    )
 
     return Div(
         header,
         Hr(),
-        render_process_list(),
+        Div(*[Process(i) for i in range(len(PROCESSES))],
+            id="pcs-list",
+            hx_trigger= "every 3s",
+            hx_swap= "innerHTML", 
+            hx_get= "pcs-list",
+            ),
         Hr(),
-        render_message_list(),
+        Div(*[Message(i) for i in range(len(MESSAGES))],
+            id="msg-list",
+            hx_trigger= "every 3s",
+            hx_swap= "innerHTML", 
+            hx_get= "msg-list",
+            ),
         footer,
     )
 
 @rt("/")
-def get():
+def home():
     return Titled("LLM Optimizer", render_content())
 
-@rt("/submit-context-data", methods=["POST"])
-def post(context: str, data: str):
-    add_task(context, data)
+@rt("/submit-context", methods=["POST"])
+def update_context(context: str, data: str):
+    CONTEXT = context
+    print(CONTEXT)
+    #DATA = data
 
-@rt("/submit-preference", methods=["POST"])
-def post(message: str):
-    add_message("user", message)
-    return render_process_list()
+@threaded
+def add_chunk(response, r_list, idx):
+    for chunk in response: 
+        if chunk.choices[0].delta.content is not None:
+            r_list[idx]["content"] += chunk.choices[0].delta.content
+
+    r_list[idx]["generating"] = False
+
+
+@app.post("/intent-check")
+def post(user_input: str):
+    m_idx = len(MESSAGES)
+    MESSAGES.append({"role": "user", "content": user_input})
+    #add_message("user", message, supabase)
+
+    intent_check = [
+        {"role": "user", "content": """
+        Determine whether the user's intention is either one of the following.
+            1. Request: informing or investigating their preference or dislikes.
+            2. General: general conversation that does not fall into Request.
+        If any part of the user's message contains Request, simply reply "request".
+        If it doesn't, respond with "general".
+        Do not give any explanation or interact with user's message.
+        """},
+        {"role": "assistant", "content": "Ok"},
+        {"role": "user", "content": user_input}
+    ]
+
+    response = gpt_response(intent_check, "text", is_stream=False)
+    verdict = response.choices[0].message.content
+
+    if verdict == "request":
+        print("request")
+        p_idx = len(PROCESSES)
+        REQUESTS.append(user_input)
+
+        for i in range(len(PROMPTS)):
+            PROCESSES.append({"role": "assistant", "content": "", "generating": True})
+
+        for i in range(len(PROMPTS)):
+            response = gpt_response(form_prompt(i), "json_object")
+            add_chunk(response, PROCESSES, p_idx+i)
+
+        #from here should be executed after every generating is true
+
+        response = gpt_response(MESSAGES, "text") #add response based on process result
+        MESSAGES.append({"role": "assistant", "content": "", "generating": True})
+        add_chunk(response, MESSAGES, m_idx+1)
+
+    elif verdict == "general":
+        print("general")
+
+        response = gpt_response(MESSAGES, "text")
+        MESSAGES.append({"role": "assistant", "content": "", "generating": True})
+        add_chunk(response, MESSAGES, m_idx+1)
+
+    else:
+        print("err")
+        MESSAGES.append({"role": "assistant", "content": "Sorry something went wrong. Please try again.", "generating": False})
+
+    return ChatInput()
 
 serve()
