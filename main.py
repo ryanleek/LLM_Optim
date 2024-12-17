@@ -318,7 +318,6 @@ def post(user_input: str):
         add_chunk(response, MESSAGES, m_idx+2)
 
         API_MESSAGES.append({"role": "assistant", "content": MESSAGES[-1]["content"]})
-        print(API_MESSAGES[-1])
 
     elif verdict == "general":
         response = gpt_response(API_MESSAGES, "text")
