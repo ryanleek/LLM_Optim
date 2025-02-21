@@ -1,5 +1,5 @@
 from datetime import datetime
-
+import numpy as np
 import pytz
 
 TIMESTAMP_FMT = "%Y-%m-%d %I:%M:%S %p KST"
@@ -25,3 +25,6 @@ def get_prompts(sup_client):
         sup_client.table("prompts").select("*").order("id", desc=False).execute()
     )
     return response.data
+
+def min_max_normalize(column):
+    return (column - np.min(column)) / (np.max(column) - np.min(column))

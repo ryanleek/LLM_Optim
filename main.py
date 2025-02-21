@@ -2,13 +2,16 @@ import os
 import json
 import string
 import copy
+import numpy as np
 
 from supabase import create_client
 from dotenv import load_dotenv
 from openai import OpenAI
+from ortools.linear_solver import pywraplp
 from fasthtml.common import*
 
-from server_component import add_message, get_messages, get_prompts
+from server_component import add_message, get_messages, get_prompts, min_max_normalize
+
 
 tlink = Script(src="https://cdn.tailwindcss.com")
 dlink = Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@4.11.1/dist/full.min.css")
@@ -18,6 +21,9 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app, rt = fast_app(hdrs=(tlink, dlink, picolink))
 
+with open('menu_vector.json', 'r') as f:
+    json_data = json.load(f)
+
 CONTEXT = ""
 PROMPTS = get_prompts(supabase)
 REQUESTS = []
@@ -26,18 +32,19 @@ MESSAGES = []
 API_MESSAGES = []
 OPTIONS = ["food", "calendar"]
 CLIENT = {
-    "objective": "",
-    "preferences": [],
-    "constraints": []
+    "fin_features": [],
+    "likes": [],
+    "dislikes": [],
+    "none": []
 }
-NONE = {
-    "preferences": [],
-    "constraints": []
-}
-DATA = ["has_beef", "has_pork", "has_chicken", "has_fish", "has_shrimp", "has_egg", "has_pickle", "has_tomato", "has_bacon", "has_seasame", "has_milk", "has_cheese",
-        "has_cilantro", "has_raw_ingredient",
-        "calorie", "fat", "protein", "carbohydrate", "sodium", "sugar", "price",
-        "is_value_deal", "preparation_time", "is_new_menu", "for_one_person", "for_two_people", "for_family"]
+FEATURES = list(json_data[0]['features'].keys())
+MENU = [([item['name']] + list(item['features'].values())) for item in json_data]
+n = len(MENU)
+
+DATA = np.array([item[1:] for item in MENU], dtype=float) 
+
+for i in range(142, 152):
+    DATA[:, i] = min_max_normalize(DATA[:, i])
 
 def gpt_response(msgL, res_type, is_stream=True):
 
@@ -49,12 +56,70 @@ def gpt_response(msgL, res_type, is_stream=True):
     stream=is_stream
 )
 
-def update_client(client, response):
+def manage_features(solver, x, data, llm_response):
+    objective = 0
+    
+    for response in llm_response:
+        feature = response["name"]
+        feat_type = response["type"]
+        preference = response["pref"]
+
+        feature_index = FEATURES.index(feature)
+
+        if feat_type == "constraint":
+
+            if preference == 1:
+                # For each item i, if it's selected (x[i] = 1), it must satisfy the constraint
+                for i in range(n):
+                    solver.Add(x[i] <= data[i, feature_index])
+            else:
+                solver.Add(sum(x[i] * data[i, feature_index] for i in range(n)) == 0)
+
+        else:
+            objective += preference * sum(x[i] * data[i, feature_index] for i in range(n))
+
+    solver.Maximize(objective)
+
+def solve_sequentially(menu, data, llm_response, num_suggestions=5):
+    selected_items = []
+    excluded_items = []
+    
+    for _ in range(num_suggestions):
+        # Reset solver for each iteration
+        solver = pywraplp.Solver.CreateSolver("SCIP")
+        n = len(menu)
+        x = [solver.BoolVar(f'x[{i}]') for i in range(n)]
+        
+        # Add constraint to select exactly one item
+        solver.Add(sum(x[i] for i in range(n)) == 1)
+        
+        # Exclude previously selected items
+        for idx in excluded_items:
+            solver.Add(x[idx] == 0)
+            
+        # Apply original constraints and objectives
+        manage_features(solver, x, data, llm_response)
+        
+        # Solve
+        status = solver.Solve()
+        
+        if status == pywraplp.Solver.OPTIMAL:
+            # Find the selected item
+            for i in range(n):
+                if x[i].solution_value() == 1:
+                    selected_items.append(menu[i][0])
+                    excluded_items.append(i)
+                    break
+        else:
+            break
+            
+    return selected_items
+
+def add_new_features(client, response):
     prev = copy.deepcopy(client)
 
-    client['objective'] += response['objective']
-    client['preferences'] += response['preferences']
-    client['constraints'] += response['constraints']
+    client['likes'].extend(list(response['preferences']))
+    client['dislikes'].extend(list(response['constraints']))
 
 def form_prompt(p_idx, client=CLIENT):
     pTemp = PROMPTS[p_idx%4]
@@ -69,48 +134,49 @@ def form_prompt(p_idx, client=CLIENT):
 
                 response = json.loads(PROCESSES[p_idx-1]['content'])
 
-                update_client(client, response)
-                client_feat = client['preferences'] + client['constraints']
+                add_new_features(client, response)
+                client_feat = client['likes'] + client['dislikes']
 
-                prompt = string.Template(pTemp['content']).substitute(cl_feat=str(client_feat), db_feat=str(DATA))
+                prompt = string.Template(pTemp['content']).substitute(cl_feat=str(client_feat), db_feat=str(FEATURES))
                 break
 
-    elif pTemp['name'] == "feat_score":
+    elif pTemp['name'] == "feat_cat":
 
         while True:
             if PROCESSES[p_idx-1]['generating'] == False:
                 response = json.loads(PROCESSES[p_idx-1]['content'])
+
+                client_feat = client['likes'] + client['dislikes']
 
                 for feat in response["result"]:
-                    for pref in client["preferences"]:
-                        if pref["name"] == feat["feature"]:
-                            if feat["db_name"] == "none":
-                                NONE["preferences"].append(pref)
-                                client["preferences"].remove(pref)
-                            
-                            else: pref["name"] = feat["db_name"]
-                            break
-                    for const in client["constraints"]:
-                        if const["name"] == feat["feature"]:
-                            if feat["db_name"] == "none":
-                                NONE["constraints"].append(const)
-                                client["constraints"].remove(const)
 
-                            else: const["name"] = feat["db_name"]
-                            break
+                    if feat["db_name"] == "none":
+                        client["none"].append(feat["feature"])
+                        continue
+
+                    else:
+                        temp = {'name': feat["feature"]}
+
+                        if temp in client["likes"]:
+                            client["likes"].remove(temp)
+                            client["likes"].append({'name': feat["db_name"]})
+                        else:
+                            client["dislikes"].remove(temp)
+                            client["dislikes"].append({'name': feat["db_name"]})
                 
-                prompt = string.Template(pTemp['content']).substitute(req = str(REQUESTS), pref = str(CLIENT["preferences"]), const = str(CLIENT["constraints"]))
+                prompt = string.Template(pTemp['content']).substitute(req = str(REQUESTS), pref = str(CLIENT["likes"]), const = str(CLIENT["dislikes"]))
                 break
 
-    elif pTemp['name'] == "func_gen":
+    elif pTemp['name'] == "recommend":
         while True:
             if PROCESSES[p_idx-1]['generating'] == False:
+
                 response = json.loads(PROCESSES[p_idx-1]['content'])
 
-                prefL = client["preferences"]
-                constL = client["constraints"]
+                client["fin_features"].extend(list(response["result"]))
+                ranked_suggestions = solve_sequentially(MENU, DATA, client["fin_features"])
 
-                prompt = string.Template(pTemp['content']).substitute(pref = str(prefL), const = str(constL))
+                prompt = string.Template(pTemp['content']).substitute(msg = str(REQUESTS), menu = str(ranked_suggestions))
                 break
 
 
@@ -205,7 +271,7 @@ def render_content():
             cls="input input-lg input-bordered w-full",
             id="context-input",
             name="context",
-            value="You work at a burger restaurant. You are trying to optimize client's choice of menu.",
+            value="You work at a shopping mall food court. The food court has 20 vendors with total 200 menu items. You are trying to optimize client's choice of menu.",
             required=True,
         ),
         Select(
