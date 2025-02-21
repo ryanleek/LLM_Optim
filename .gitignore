@@ -133,6 +133,10 @@ ENV/
 env.bak/
 venv.bak/
 
+#prompts
+.prompts
+prompts/
+
 # Spyder project settings
 .spyderproject
 .spyproject
